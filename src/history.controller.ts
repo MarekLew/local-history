@@ -11,7 +11,7 @@ const mkdirp = require('mkdirp');
 const enum EHistorySaveMode {
     None = 1,
     Internal,
-    External,
+    External
 }
 
 interface IHistorySettings {
@@ -51,6 +51,27 @@ export default class HistoryController {
         this.settings = this.readSettings();
     }
 
+    public saveOriginal(event: vscode.TextDocumentWillSaveEvent) {
+        const documentWithNoTsError: any = event.document;
+
+        if (this.settings.saveMode === EHistorySaveMode.None || !this.settings.enabled) {
+            return;
+        }
+
+        if (!(event.document && /*document.isDirty &&*/ event.document.fileName)) {
+            return;
+        }
+
+        // don't save without workspace (cause exclude is relative to workspace)
+        if (vscode.workspace.rootPath === null)
+            return;
+
+        // TODO return if save document is exlcuded
+        // TODO return if original already exists
+        if (!documentWithNoTsError['custom-xyz-original'])
+            documentWithNoTsError['custom-xyz-original'] = fs.readFileSync(event.document.fileName);
+    }
+
     public saveRevision(document: vscode.TextDocument) {
         if (this.settings.saveMode === EHistorySaveMode.None || !this.settings.enabled) {
             return;
@@ -78,29 +99,25 @@ export default class HistoryController {
                 // files.length must be 1 and
                 // files[0].fsPath === document.fileName
 
-                let me = this,
-                    now, revisionFile,
-                    p: path.ParsedPath;
+                const me = this,
+                      documentWithNoTsError: any = document,
+                      revisionFiles = me.getRevisionFiles(document.fileName, path.dirname(relativeFile));
 
-                now = new Date();
-                p = path.parse(document.fileName);
-                revisionFile =  // toto_20151213215326.js
-                        p.name+'_'+
-                        String(10000*now.getFullYear() + 100*(now.getMonth()+1) + now.getDate()) +
-                        (now.getHours() < 10 ? '0' : '') +
-                        String(10000*now.getHours() + 100*now.getMinutes() + now.getSeconds()) +
-                        p.ext ;
+                if (me.mkDirRecursive(revisionFiles.path)) {
 
-                revisionFile = path.join(
-                        me.settings.historyPath,
-                        path.dirname(relativeFile),
-                        revisionFile);
+                    // save original version
+                    if (documentWithNoTsError['custom-xyz-original']) {
+                        // TODO : if already some files don't save an original version (cause: the really original version is lost) !
+                        if (!fs.existsSync(revisionFiles.original)) {
+                            me.copyBuffer(document.fileName, documentWithNoTsError['custom-xyz-original'], revisionFiles.original);
+                        }
+                    }
 
-                if (me.mkDirRecursive(revisionFile) &&
-                    me.copyFile(document.fileName, revisionFile)) {
+                    // save revision
+                    me.copyFile(document.fileName, revisionFiles.revision);
 
                     if (me.settings.daysLimit > 0)
-                        me.purge(document, revisionFile);
+                        me.purge(document, revisionFiles.revision);
                 };
             });
     }
@@ -157,6 +174,7 @@ export default class HistoryController {
                         if (this.settings.maxDisplay && !noLimit)
                             files = files.slice(this.settings.maxDisplay * -1);
                         // files are absolute
+                        // TODO : display original file
                     }
                     resolve(files);
                 } else
@@ -193,7 +211,7 @@ export default class HistoryController {
                     properties = me.decodeFile(file);
                     displayFiles.push({
                         description: relative,
-                        label: properties.date.toLocaleString(),
+                        label: properties.date.toLocaleString(),  // TODO if original no date...
                         filePath: file,
                         previous: files[index - 1]
                     });
@@ -310,6 +328,39 @@ export default class HistoryController {
         return path.join(root, dir, name + pattern + ext);
     }
 
+    private getRevisionFiles(filename, relativeDir) {
+        const me = this,
+            now = new Date(),
+            p = path.parse(filename);
+
+        return {
+            path: path.join(
+                    me.settings.historyPath,
+                    relativeDir
+            ),
+
+            revision: path.join(
+                    me.settings.historyPath,
+                    relativeDir,
+
+                    // toto_20151213215326.js
+                    p.name+'_'+
+                    String(10000*now.getFullYear() + 100*(now.getMonth()+1) + now.getDate()) +
+                    (now.getHours() < 10 ? '0' : '') +
+                    String(10000*now.getHours() + 100*now.getMinutes() + now.getSeconds()) +
+                    p.ext
+            ),
+
+            original: path.join(
+                    me.settings.historyPath,
+                    relativeDir,
+
+                    // toto_000000000000000.js // TODO: or get original date to avoid 1899 date on display
+                    p.name+'_'+ ('0'.repeat(14)) + p.ext
+            )
+        }
+    }
+
     private findCurrent(activeFilename: string): vscode.Uri {
         if (this.settings.saveMode === EHistorySaveMode.None)
           return vscode.Uri.file(activeFilename);
@@ -357,6 +408,9 @@ export default class HistoryController {
                     }
                 }
             });
+
+        // TODO purge original file ?
+        // TODO delete document['custom-xyz-original']
     }
 
     private getRelativePath(fileName: string) {
@@ -368,24 +422,34 @@ export default class HistoryController {
             return path.basename(fileName);
     }
 
-    private mkDirRecursive(fileName: string): boolean {
+    private mkDirRecursive(dirname: string): boolean {
         try {
-            mkdirp.sync(path.dirname(fileName));
+            mkdirp.sync(dirname);
             return true;
         }
         catch (err) {
-            vscode.window.showErrorMessage(`Error with mkdir: '${err.toString()}' file '${fileName}`);
+            vscode.window.showErrorMessage(`Error with mkdir: '${err.toString()}' path '${dirname}`);
             return false;
         }
     }
 
     private copyFile(source, target): boolean {
         try {
-            fs.writeFileSync(target, fs.readFileSync(source));
-            return true;
+            return this.copyBuffer(source, fs.readFileSync(source), target);
         }
         catch (err) {
             vscode.window.showErrorMessage(`Error with copyFile: '${err.toString()} ${source} => ${target}`);
+            return false;
+        }
+    }
+
+    private copyBuffer(source, buffer, target): boolean {
+        try {
+            fs.writeFileSync(target, buffer);
+            return true;
+        }
+        catch (err) {
+            vscode.window.showErrorMessage(`Error with copyBuffer: '${err.toString()} ${source} => ${target}`);
             return false;
         }
     }

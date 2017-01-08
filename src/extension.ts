@@ -16,6 +16,9 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerTextEditorCommand('local-history.compareToPrevious', controller.compareToPrevious, controller));
 
     // Create history on save document
+    vscode.workspace.onWillSaveTextDocument(document => {
+        controller.saveOriginal(document);
+    });
     vscode.workspace.onDidSaveTextDocument(document => {
         controller.saveRevision(document);
     });
