@@ -1,5 +1,3 @@
-'use strict';
-
 import * as vscode from 'vscode';
 
 import fs = require('fs');
@@ -37,6 +35,19 @@ interface IHistoryFileProperties {
     date?: Date;
 }
 
+interface IHistoryOriginal {
+    content: Buffer;
+    date: Date;
+}
+
+interface IHistoryDocument {
+    file: vscode.Uri;
+    relative?: string;
+    original?: IHistoryOriginal;
+    excluded?: boolean;
+    //TODO cache historyFiles[]
+}
+
 /**
  * Controller for handling history.
  */
@@ -47,12 +58,23 @@ export default class HistoryController {
     private pattern = '_'+('[0-9]'.repeat(14));
     private regExp = /_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/;
 
-    constructor() {
+    private documentFlles: IHistoryDocument[] = [];
+
+    constructor(context: vscode.ExtensionContext) {
         this.settings = this.readSettings();
+
+        // watch directory .history
+        if (this.settings.saveMode !== EHistorySaveMode.None && this.settings.enabled) {
+            if (vscode.workspace.rootPath !== null) {
+                // TODO test external path...(doesn't work !?...)
+                const filesWatcher = vscode.workspace.createFileSystemWatcher(this.settings.historyPath+'/*');
+                context.subscriptions.push(filesWatcher);
+                filesWatcher.onDidDelete(this.doHistoryWatcherDelete, this, context.subscriptions);
+            }
+        }
     }
 
     public saveOriginal(event: vscode.TextDocumentWillSaveEvent) {
-        const documentWithNoTsError: any = event.document;
 
         if (this.settings.saveMode === EHistorySaveMode.None || !this.settings.enabled) {
             return;
@@ -66,10 +88,19 @@ export default class HistoryController {
         if (vscode.workspace.rootPath === null)
             return;
 
-        // TODO return if save document is exlcuded
-        // TODO return if original already exists
-        if (!documentWithNoTsError['custom-xyz-original'])
-            documentWithNoTsError['custom-xyz-original'] = fs.readFileSync(event.document.fileName);
+        // Save original with dateTime
+        const documentFile = this.getDocumentFile(event.document.uri, true);
+        if (!documentFile.excluded && !documentFile.original) {
+            try {
+                const state = fs.statSync(event.document.fileName);
+                documentFile.original = {
+                    content: fs.readFileSync(event.document.fileName),
+                    date: state && state.mtime
+                };
+            } catch (err) {
+                console.log(`Original file ${event.document.fileName} cannot be saved ${err}`);
+            }
+        }
     }
 
     public saveRevision(document: vscode.TextDocument) {
@@ -85,14 +116,21 @@ export default class HistoryController {
         if (vscode.workspace.rootPath === null)
             return;
 
-        // fix for 1.7.1 : use charater \ with findFiles to work with subfolder in windows #15424
-        let relativeFile = this.getRelativePath(document.fileName).replace(/\//g, path.sep);
+        const documentFile = this.getDocumentFile(document.uri, true);
+        if (documentFile.excluded)
+            return;
+
+        if (!documentFile.relative)
+            // fix for 1.7.1 : use charater \ with findFiles to work with subfolder in windows #15424
+            documentFile.relative = this.getRelativePath(document.fileName).replace(/\//g, path.sep);
 
         // if it's an exclude file or folder don't do anything
-        vscode.workspace.findFiles(relativeFile, this.settings.exclude)
+        vscode.workspace.findFiles(documentFile.relative, this.settings.exclude)
             .then(files => {
                 // exclude file
                 if (!files || !files.length) {
+                    delete documentFile.original;
+                    documentFile.excluded = true;
                     return;
                 }
 
@@ -100,24 +138,29 @@ export default class HistoryController {
                 // files[0].fsPath === document.fileName
 
                 const me = this,
-                      documentWithNoTsError: any = document,
-                      revisionFiles = me.getRevisionFiles(document.fileName, path.dirname(relativeFile));
+                      revisionFiles = me.getRevisionFiles(documentFile);
 
                 if (me.mkDirRecursive(revisionFiles.path)) {
 
+                    let historyFiles;
+
                     // save original version
-                    if (documentWithNoTsError['custom-xyz-original']) {
-                        // TODO : if already some files don't save an original version (cause: the really original version is lost) !
-                        if (!fs.existsSync(revisionFiles.original)) {
-                            me.copyBuffer(document.fileName, documentWithNoTsError['custom-xyz-original'], revisionFiles.original);
+                    if (documentFile.original.content && revisionFiles.original) {
+                        // if already some files exists, don't save an original version (cause: the really original version is lost) !
+                        historyFiles = historyFiles || me.getHistoryFilesSync(revisionFiles.pattern);
+                        if (!historyFiles.length) {
+                            me.copyBuffer(document.fileName, documentFile.original.content, revisionFiles.original);
                         }
                     }
+                    delete documentFile.original.content;
 
                     // save revision
                     me.copyFile(document.fileName, revisionFiles.revision);
 
-                    if (me.settings.daysLimit > 0)
-                        me.purge(document, revisionFiles.revision);
+                    if (me.settings.daysLimit > 0) {
+                        historyFiles = historyFiles || me.getHistoryFilesSync(revisionFiles.pattern);
+                        me.purgeFiles(historyFiles);
+                    }
                 };
             });
     }
@@ -158,6 +201,15 @@ export default class HistoryController {
     }
 
     /* private */
+    private getDocumentFile(file: vscode.Uri, add?: Boolean): IHistoryDocument {
+        let result = this.documentFlles.find( element => element.file.fsPath === file.fsPath );
+        if (add && !result) {
+            result = {file: file};
+            this.documentFlles.push(result);
+        }
+        return result;
+    }
+
     private getHistoryFiles(patternFilePath: string, noLimit?: boolean): Thenable<string[]> {
 
         return new Promise((resolve, reject) => {
@@ -174,13 +226,18 @@ export default class HistoryController {
                         if (this.settings.maxDisplay && !noLimit)
                             files = files.slice(this.settings.maxDisplay * -1);
                         // files are absolute
-                        // TODO : display original file
                     }
                     resolve(files);
                 } else
                     reject(err);
             });
         });
+    }
+
+    private getHistoryFilesSync(patternFilePath: string): string[] {
+        // glob must use character /
+        const historyPath = this.settings.historyPath.replace(/\\/g, '/');
+        return glob.sync(patternFilePath, {cwd: historyPath}) || [];
     }
 
     private internalShowAll(action, editor: vscode.TextEditor) {
@@ -211,7 +268,7 @@ export default class HistoryController {
                     properties = me.decodeFile(file);
                     displayFiles.push({
                         description: relative,
-                        label: properties.date.toLocaleString(),  // TODO if original no date...
+                        label: properties.date.toLocaleString(),
                         filePath: file,
                         previous: files[index - 1]
                     });
@@ -323,42 +380,34 @@ export default class HistoryController {
         };
     }
 
-    private joinPath(root: string, dir: string, name: string, ext: string, history: boolean): string {
-        let pattern = history === true ? this.pattern : '';
+    private joinPath(root: string, dir: string, name: string, ext: string, history: boolean, date?: Date): string {
+        let pattern = '';
+
+        if (date)
+            pattern = '_'+
+                String(10000*date.getFullYear() + 100*(date.getMonth()+1) + date.getDate()) +
+                (date.getHours() < 10 ? '0' : '') +
+                String(10000*date.getHours() + 100*date.getMinutes() + date.getSeconds());
+        else if (history === true)
+            pattern = this.pattern;
+
         return path.join(root, dir, name + pattern + ext);
     }
 
-    private getRevisionFiles(filename, relativeDir) {
+    private getRevisionFiles(documentFile: IHistoryDocument) {
         const me = this,
             now = new Date(),
-            p = path.parse(filename);
+            relativeDir = path.dirname(documentFile.relative),
+            p = path.parse(documentFile.file.fsPath),
+            result: any = {};
 
-        return {
-            path: path.join(
-                    me.settings.historyPath,
-                    relativeDir
-            ),
+        result.path = path.join(me.settings.historyPath, relativeDir);
+        result.pattern = me.joinPath(me.settings.historyPath, relativeDir, p.name, p.ext, true);
+        result.revision = me.joinPath(me.settings.historyPath, relativeDir, p.name, p.ext, true, now);
+        if (documentFile.original && documentFile.original.date)
+            result.original = me.joinPath(me.settings.historyPath, relativeDir, p.name, p.ext, true, documentFile.original.date);
 
-            revision: path.join(
-                    me.settings.historyPath,
-                    relativeDir,
-
-                    // toto_20151213215326.js
-                    p.name+'_'+
-                    String(10000*now.getFullYear() + 100*(now.getMonth()+1) + now.getDate()) +
-                    (now.getHours() < 10 ? '0' : '') +
-                    String(10000*now.getHours() + 100*now.getMinutes() + now.getSeconds()) +
-                    p.ext
-            ),
-
-            original: path.join(
-                    me.settings.historyPath,
-                    relativeDir,
-
-                    // toto_000000000000000.js // TODO: or get original date to avoid 1899 date on display
-                    p.name+'_'+ ('0'.repeat(14)) + p.ext
-            )
-        }
+        return result;
     }
 
     private findCurrent(activeFilename: string): vscode.Uri {
@@ -372,45 +421,30 @@ export default class HistoryController {
             return vscode.Uri.file(activeFilename);
     }
 
-    private purge(document: vscode.TextDocument, historyFile?: string) {
-        let me = this,
-            dir, name, ext,
-            pattern;
-
-        if (historyFile) {
-            dir = path.dirname(historyFile);
-            ext = path.extname(document.fileName);
-            name = path.basename(document.fileName, ext);
-            pattern = me.joinPath('', dir, name, ext, true);
-        } else {
-            let fileProperties = this.decodeFile(document.fileName, true);
-            pattern = fileProperties && fileProperties.file;
+    private purgeFiles(files: string[]) {
+        if (!files || !files.length) {
+            return;
         }
 
-        me.getHistoryFiles(pattern, true)
-            .then(files => {
+        let me = this,
+            stat: fs.Stats,
+            now: number = new Date().getTime(),
+            endTime: number;
 
-                if (!files || !files.length) {
-                    return;
+        for (let file of files) {
+            stat = fs.statSync(file);
+            if (stat && stat.isFile()) {
+                endTime = stat.birthtime.getTime() + me.settings.daysLimit * 24*60*60*1000;
+                if (now > endTime) {
+                    fs.unlinkSync(file);
                 }
+            }
+        }
+    }
 
-                let stat: fs.Stats,
-                    now: number = new Date().getTime(),
-                    endTime: number;
-
-                for (let file of files) {
-                    stat = fs.statSync(file);
-                    if (stat && stat.isFile()) {
-                        endTime = stat.birthtime.getTime() + me.settings.daysLimit * 24*60*60*1000;
-                        if (now > endTime) {
-                            fs.unlinkSync(file);
-                        }
-                    }
-                }
-            });
-
-        // TODO purge original file ?
-        // TODO delete document['custom-xyz-original']
+    private doHistoryWatcherDelete(file: vscode.Uri) {
+        // TODO
+        console.log(`Delete file ${file.fsPath}`);
     }
 
     private getRelativePath(fileName: string) {

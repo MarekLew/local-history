@@ -7,7 +7,7 @@ import HistoryContentProvider  from './historyContent.provider';
 * Activate the extension.
 */
 export function activate(context: vscode.ExtensionContext) {
-    const controller = new HistoryController();
+    const controller = new HistoryController(context);
 
     context.subscriptions.push(vscode.commands.registerTextEditorCommand('local-history.showAll', controller.showAll, controller));
     context.subscriptions.push(vscode.commands.registerTextEditorCommand('local-history.showCurrent', controller.showCurrent, controller));
@@ -18,10 +18,10 @@ export function activate(context: vscode.ExtensionContext) {
     // Create history on save document
     vscode.workspace.onWillSaveTextDocument(document => {
         controller.saveOriginal(document);
-    });
+    }, this, context.subscriptions);
     vscode.workspace.onDidSaveTextDocument(document => {
         controller.saveRevision(document);
-    });
+    }, this, context.subscriptions);
 
     // Show all local-history files
     const contentProvider = new HistoryContentProvider(controller);
